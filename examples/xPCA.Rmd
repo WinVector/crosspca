@@ -1,0 +1,218 @@
+---
+title: "xPCA"
+author: "Win-Vector LLC"
+date: "July 14, 2016"
+output:
+  md_document:
+    variant: markdown_github
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=7, fig.height=7,
+                      echo=TRUE, warning=FALSE, message=FALSE)
+
+library('ggplot2')
+library('tidyr')
+library('vtreat')
+library('WVPlots') # devtools::install_github('WinVector/WVPlots',build_vignettes=TRUE)
+library("crosspca") # devtools::install_github('WinVector/crosspca')
+
+extractProjection <- function(ndim,princ) {
+  # pull off the rotation.  
+  proj <- princ$rotation[,1:ndim] 
+  # sign was arbitrary, so flip in convenient form
+  for(i in seq_len(ndim)) {
+    si <- sign(mean(proj[,i]))
+    if(si!=0) {
+      proj[,i] <- proj[,i]*si
+    }
+  }
+  proj
+}
+
+rsq <- function(x,y) {
+  1 - sum((y-x)^2)/sum((y-mean(y))^2)
+}
+```
+
+
+```{r mkdata}
+# see: http://www.win-vector.com/blog/2016/05/pcr_part2_yaware/
+# build example where even and odd variables are bringing in noisy images
+# of two different signals.
+mkData <- function(n) {
+  for(group in 1:10) {
+    # y is the sum of two effects yA and yB
+    yA <- rnorm(n)
+    yB <- rnorm(n)
+    if(group==1) {
+      d <- data.frame(y=yA+yB+rnorm(n))
+      code <- 'x'
+    } else {
+      code <- paste0('noise',group-1)
+    }
+    yS <- list(yA,yB)
+    # these variables are correlated with y in in group 1
+    for(i in 1:5) {
+      vi <- yS[[1+(i%%2)]] + rnorm(nrow(d))
+      d[[paste(code,formatC(i,width=2,flag=0),sep='.')]] <-  ncol(d)*vi
+    }
+  }
+  d
+}
+```
+
+
+```{r makedata}
+# make data
+set.seed(23525)
+dTrain <- mkData(1000)
+dTest <- mkData(1000)
+```
+
+
+
+```{r yaware, echo=FALSE}
+ncores <- parallel::detectCores()
+pClus <- parallel::makeCluster(ncores)
+vars <- setdiff(colnames(dTrain),'y')
+k <- 10
+print(length(vars))
+
+prepMethods <- list()
+prepMethods[['x-only scaling']] <- function() {
+  # standard x only scaling
+  print("std x-only scaling")
+  sc <- scale(as.matrix(dTrain[,vars]),center=TRUE,scale=TRUE)
+  cnt <- attr(sc,'scaled:center')
+  scl <- attr(sc,'scaled:scale')
+  badcol <- colSums(is.na(sc))>0
+  dmTrain <- sc[,!badcol]
+  dmTest <- scale(as.matrix(dTest[,vars]),center=cnt,scale=scl)[,!badcol]
+  methodStr <- 'x-only scaling'
+  list(methodStr=methodStr,dmTrain=dmTrain,dmTest=dmTest)
+}
+prepMethods[['direct y-aware scaling']] <- function() {
+  print("using direct method")
+  # y-aware scale by hand
+  dmTrain <- data.frame(matrix(nrow=nrow(dTrain),ncol=0))
+  dmTest <- data.frame(matrix(nrow=nrow(dTest),ncol=0))
+  for(v in vars) {
+    lmi <- lm(paste('y',v,sep=' ~ '),data=dTrain)
+    if(max(dTrain[[v]])>min(dTest[[v]])) {
+      ai <- lmi$coefficients[[v]]
+      if((ai!=0)&&(!is.na(ai))&&(!is.na(ai))&&(!is.infinite(ai))) {
+        bi <- -mean(ai*dTrain[[v]])
+        dmTrain[[v]] <- ai*dTrain[[v]]+bi
+        dmTest[[v]] <- ai*dTest[[v]]+bi
+      }
+    }
+  }
+  methodStr <- 'in-sample y-aware scaling'
+  list(methodStr=methodStr,dmTrain=dmTrain,dmTest=dmTest)
+}
+prepMethods[['vtreat direct y-aware scaling']] <- function() {
+  print("vtreat y-aware direct scaling")
+  pruneSig = NULL # leaving null to prevent (useful) pruning, in practice set to 1/length(vars) or some such.
+  treatmentPlan <- vtreat::designTreatmentsN(dTrain,vars,'y',parallelCluster=pClus)
+  newvars <- treatmentPlan$scoreFrame$varName
+  dmTrain <-  as.matrix(vtreat::prepare(treatmentPlan,dTrain,scale=TRUE,
+                                      pruneSig=pruneSig,parallelCluster=pClus)[,newvars])
+  print(length(newvars))
+  dmTest <- as.matrix(vtreat::prepare(treatmentPlan,dTest,scale=TRUE,
+                                      pruneSig=pruneSig,parallelCluster=pClus)[,newvars])
+  methodStr <- 'vtreat in-sample y-aware scaling'
+  list(methodStr=methodStr,dmTrain=dmTrain,dmTest=dmTest)
+}
+prepMethods[['vtreat cross y-aware scaling']] <- function() {
+  print("vtreat y-aware cross scaling")
+  pruneSig = NULL # leaving null to prevent (useful) pruning, in practice set to 1/length(vars) or some such.
+  cfe <- vtreat::mkCrossFrameNExperiment(dTrain,vars,'y',scale=TRUE,parallelCluster=pClus)
+  treatmentPlan <- cfe$treatments
+  newvars <- treatmentPlan$scoreFrame$varName
+  dmTrain <- as.matrix(cfe$crossFrame[,newvars])
+  print(length(newvars))
+  dmTest <- as.matrix(vtreat::prepare(treatmentPlan,dTest,scale=TRUE,
+                                      pruneSig=pruneSig,parallelCluster=pClus)[,newvars])
+  methodStr <- 'vtreat out-sample y-aware scaling'
+  list(methodStr=methodStr,dmTrain=dmTrain,dmTest=dmTest)
+}
+
+for(mi in names(prepMethods)) {
+  methodi <- prepMethods[[mi]]
+  preps <- methodi()
+  methodStr <- preps$methodStr
+  dmTrain <- preps$dmTrain
+  dmTest <- preps$dmTest
+  
+  print("*******************************************")
+  
+  print(methodStr)
+  
+  print(summary(dmTrain))
+  
+  # std method
+  princ <- prcomp(dmTrain, center = FALSE, scale. = FALSE)
+  pvars <- colnames(princ$rotation)[seq_len(k)]
+  proj <- extractProjection(k,princ)
+  projectedTrain <- as.data.frame(as.matrix(dmTrain) %*% proj,
+                                  stringsAsFactors = FALSE)
+  projectedTrain$y <- dTrain$y
+  projectedTest <- as.data.frame(as.matrix(dmTest) %*% proj,
+                                 stringsAsFactors = FALSE)
+  projectedTest$y <- dTest$y
+  formula <- paste('y',paste(pvars,collapse=' + '),sep=' ~ ')
+  head(projectedTrain)
+  model <- lm(formula,data=projectedTrain)
+  print(summary(model))
+  projectedTrain$pred <- predict(model,newdata = projectedTrain)
+  projectedTest$pred <- predict(model,newdata = projectedTest)
+  
+  ScatterHist(projectedTrain,'pred','y',
+              paste(methodStr,'\n',k,'component model on train'),
+              smoothmethod='identity',annot_size=3)
+  trainrsq <- rsq(projectedTrain$pred,projectedTrain$y)
+  print(paste("train rsq",trainrsq))
+  
+  ScatterHist(projectedTest,'pred','y',
+              paste(methodStr,'\n',k,'component model on test'),
+              smoothmethod='identity',annot_size=3)
+  testrsq <- rsq(projectedTest$pred,projectedTest$y)
+  print(paste("test rsq",testrsq))
+  
+  # cross method
+  splitPlan <- vtreat::kWayCrossValidation(nrow(dmTrain),10,NULL,NULL)
+  xcross <- crosspca::xprcomp(dmTrain,
+                              k,splitPlan,
+                              center = FALSE, scale. = FALSE)
+  #print(xcross$mappings)
+  projectedTrainX <- as.data.frame(xcross$train,
+                                   stringsAsFactors = FALSE)
+  projectedTrainX$y <- dTrain$y
+  formula <- paste('y',paste(pvars,collapse=' + '),sep=' ~ ')
+  head(projectedTrainX)
+  modelX <- lm(formula,data=projectedTrainX)
+  print(summary(modelX))
+  projectedTrainX$predX <- predict(modelX,newdata = projectedTrainX)
+  projectedTestX <- as.data.frame(predict(xcross$p,dmTest),
+                                  stringsAsFactors = FALSE)
+  projectedTestX$y <- dTest$y
+  projectedTestX$predX <- predict(modelX,newdata = projectedTestX)
+  
+  ScatterHist(projectedTrainX,'predX','y',
+              paste(methodStr,'\n',k,'component modelX on train'),
+              smoothmethod='identity',annot_size=3)
+  trainrsqX <- rsq(projectedTrainX$predX,projectedTrainX$y)
+  print(paste("train rsq",trainrsqX))
+  
+  ScatterHist(projectedTestX,'predX','y',
+              paste(methodStr,'\n',k,'component modelX on test'),
+              smoothmethod='identity',annot_size=3)
+  testrsqX <- rsq(projectedTestX$predX,projectedTestX$y)
+  print(paste("test rsq",testrsqX))
+}
+
+
+parallel::stopCluster(pClus)
+```

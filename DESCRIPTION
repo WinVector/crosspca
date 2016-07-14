@@ -1,0 +1,17 @@
+Package: crosspca
+Type: Package
+Title: Cross Validated Principal Components Analysis
+Version: 0.1.0
+Author: John Mount <jmount@win-vector.com>
+Maintainer: John Mount <jmount@win-vector.com>
+Description: Generates cross validated principal components projections
+    suitable for use as part of nested or sequential models (such as cross validated
+    principal components regression).
+License: GPL-3
+LazyData: TRUE
+RoxygenNote: 5.0.1
+Depends:
+  lpSolve,
+  svd,
+  vtreat
+Suggests: testthat
